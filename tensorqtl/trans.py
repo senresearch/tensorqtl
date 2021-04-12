@@ -48,10 +48,11 @@ def filter_cis(pairs_df, tss_dict, variant_df, window=5000000):
 def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
               return_sparse=True, pval_threshold=1e-5, maf_threshold=0.05,
               alleles=2, return_r2=False, batch_size=20000,
-              logger=None, verbose=True):
+              logger=None, verbose=True, device="cpu"):
     """Run trans-QTL mapping"""
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda")
+    # device = torch.device("cpu")
 
     if logger is None:
         logger = SimpleLogger(verbose=verbose)
@@ -76,6 +77,8 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
     if interaction_s is not None:
         logger.write('  * including interaction term')
 
+    
+    
     phenotypes_t = torch.tensor(phenotype_df.values, dtype=torch.float32).to(device)
     genotype_ix = np.array([genotype_df.columns.tolist().index(i) for i in phenotype_df.columns])
     genotype_ix_t = torch.from_numpy(genotype_ix).to(device)
@@ -90,9 +93,11 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
 
     if interaction_s is None:
         ggt = genotypeio.GenotypeGeneratorTrans(genotype_df, batch_size=batch_size)
-        start_time = time.time()
+        # start_time = time.time()
         res = []
         n_variants = 0
+        start_time = time.time()
+        
         for k, (genotypes, variant_ids) in enumerate(ggt.generate_data(verbose=verbose), 1):
             # copy genotypes to GPU
             genotypes_t = torch.tensor(genotypes, dtype=torch.float).to(device)
@@ -127,7 +132,9 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
                 r_t = r_t.type(torch.float64)
                 tstat_t = r_t * torch.sqrt(dof / (1 - r_t.pow(2)))
                 res.append(np.c_[variant_ids, tstat_t.cpu()])
-        logger.write('    elapsed time: {:.2f} min'.format((time.time()-start_time)/60))
+
+        elapsed_time = (time.time()-start_time)
+        logger.write('    elapsed time: {:.2f} sec'.format(elapsed_time))
         del phenotypes_t
         del residualizer
 
@@ -151,7 +158,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
         if maf_threshold > 0:
             logger.write('  * {} variants passed MAF >= {:.2f} filtering'.format(n_variants, maf_threshold))
         logger.write('done.')
-        return pval_df
+        return pval_df, elapsed_time
 
     else:  # interaction model
         dof = n_samples - 4 - covariates_df.shape[1]
