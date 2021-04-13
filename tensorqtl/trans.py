@@ -7,6 +7,7 @@ from collections import OrderedDict
 import sys
 import os
 import time
+import datetime
 
 sys.path.insert(1, os.path.dirname(__file__))
 import genotypeio
@@ -78,10 +79,34 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
         logger.write('  * including interaction term')
 
     
+    data_transfer_time = 0.0 
+    computation_time = 0.0 
+    result_reorg_time = 0.0
+    pval_calc_time = 0.0 
+
     
-    phenotypes_t = torch.tensor(phenotype_df.values, dtype=torch.float32).to(device)
+
+    pheno_onload_start = torch.cuda.Event(enable_timing=True)
+    pheno_onload_end = torch.cuda.Event(enable_timing=True)
+
+    geno_onload_start = torch.cuda.Event(enable_timing=True)
+    geno_onload_end = torch.cuda.Event(enable_timing=True)
+
+    res_offload_start = torch.cuda.Event(enable_timing=True)
+    res_offload_end = torch.cuda.Event(enable_timing=True)
+
+    compute_start = torch.cuda.Event(enable_timing=True)
+    compute_end = torch.cuda.Event(enable_timing=True)
+
+    start_time = time.time()
     genotype_ix = np.array([genotype_df.columns.tolist().index(i) for i in phenotype_df.columns])
+    # Initiate dummy transfer to remove first time cost to call the function. 
+    # dummy_transfer = torch.from_numpy(np.array([[1.0, 1.0], [1.0, 1.0]])).to(device)
+
+    pheno_onload_start.record()
     genotype_ix_t = torch.from_numpy(genotype_ix).to(device)
+    phenotypes_t = torch.tensor(phenotype_df.values, dtype=torch.float32).to(device)
+    pheno_onload_end.record()
 
     # calculate correlation threshold for sparse output
     if return_sparse:
@@ -92,16 +117,19 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
         r_threshold = None
 
     if interaction_s is None:
+        
         ggt = genotypeio.GenotypeGeneratorTrans(genotype_df, batch_size=batch_size)
         # start_time = time.time()
         res = []
         n_variants = 0
-        start_time = time.time()
         
         for k, (genotypes, variant_ids) in enumerate(ggt.generate_data(verbose=verbose), 1):
             # copy genotypes to GPU
+            geno_onload_start.record()
             genotypes_t = torch.tensor(genotypes, dtype=torch.float).to(device)
+            geno_onload_end.record() 
 
+            compute_start.record()
             # filter by MAF
             genotypes_t = genotypes_t[:,genotype_ix_t]
             impute_mean(genotypes_t)
@@ -114,36 +142,59 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
             if return_sparse:
                 m = r_t.abs() >= r_threshold
                 ix_t = m.nonzero(as_tuple=False)  # sparse index
-                ix = ix_t.cpu().numpy()
-
-                r_t = r_t.masked_select(m).type(torch.float64)
+                
+                # r_t = r_t.masked_select(m).type(torch.float64)
+                r_t = r_t.masked_select(m).type(torch.float32)
                 r2_t = r_t.pow(2)
                 tstat_t = r_t * torch.sqrt(dof / (1 - r2_t))
                 std_ratio_t = torch.sqrt(phenotype_var_t[ix_t[:,1]] / genotype_var_t[ix_t[:,0]])
                 b_t = r_t * std_ratio_t
                 b_se_t = (b_t / tstat_t).type(torch.float32)
 
+                res_offload_start.record()
+                ix = ix_t.cpu().numpy()    
+                tstat_tcpu = tstat_t.cpu()
+                b_tcpu = b_t.cpu()
+                b_se_tcpu = b_se_t.cpu()   
+                r2_tfloatcpu = r2_t.float().cpu()
+                maf_tcpu = maf_t[ix_t[:,0]].cpu()
+                res_offload_end.record()
+
+                result_reorg_time_start = time.time()
                 res.append(np.c_[
                     variant_ids[ix[:,0]], phenotype_df.index[ix[:,1]],
-                    tstat_t.cpu(), b_t.cpu(), b_se_t.cpu(),
-                    r2_t.float().cpu(), maf_t[ix_t[:,0]].cpu()
+                    tstat_tcpu, b_tcpu, b_se_tcpu,
+                    r2_tfloatcpu, maf_tcpu
                 ])
+                result_reorg_time += time.time() - result_reorg_time_start
+                
             else:
-                r_t = r_t.type(torch.float64)
+                # r_t = r_t.type(torch.float64)
+                r_t = r_t.type(torch.float32)
                 tstat_t = r_t * torch.sqrt(dof / (1 - r_t.pow(2)))
-                res.append(np.c_[variant_ids, tstat_t.cpu()])
+                
+                res_offload_start.record()
+                tstat_tcpu = tstat_t.cpu()
+                res_offload_end.record() 
 
-        elapsed_time = (time.time()-start_time)
-        logger.write('    elapsed time: {:.2f} sec'.format(elapsed_time))
+                result_reorg_time_start = time.time()
+                res.append(np.c_[variant_ids, tstat_tcpu])  
+                result_reorg_time += time.time() - result_reorg_time_start
+            compute_end.record()
+
+        # logger.write('    elapsed time: {:.2f} sec'.format(elapsed_time))
         del phenotypes_t
         del residualizer
 
+        pval_calc_time_start = time.time()
         # post-processing: concatenate batches
         res = np.concatenate(res)
         if return_sparse:
-            res[:,2] = 2*stats.t.cdf(-np.abs(res[:,2].astype(np.float64)), dof)
+            # res[:,2] = 2*stats.t.cdf(-np.abs(res[:,2].astype(np.float64)), dof)
+            res[:,2] = 2*stats.t.cdf(-np.abs(res[:,2].astype(np.float32)), dof)
             pval_df = pd.DataFrame(res, columns=['variant_id', 'phenotype_id', 'pval', 'b', 'b_se', 'r2', 'maf'])
-            pval_df['pval'] = pval_df['pval'].astype(np.float64)
+            # pval_df['pval'] = pval_df['pval'].astype(np.float64)
+            pval_df['pval'] = pval_df['pval'].astype(np.float32)
             pval_df['b'] = pval_df['b'].astype(np.float32)
             pval_df['b_se'] = pval_df['b_se'].astype(np.float32)
             pval_df['r2'] = pval_df['r2'].astype(np.float32)
@@ -151,13 +202,28 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
             if not return_r2:
                 pval_df.drop('r2', axis=1, inplace=True)
         else:
-            pval = 2*stats.t.cdf(-np.abs(res[:,1:].astype(np.float64)), dof)
+            # pval = 2*stats.t.cdf(-np.abs(res[:,1:].astype(np.float64)), dof)
+            pval = 2*stats.t.cdf(-np.abs(res[:,1:].astype(np.float32)), dof)
             pval_df = pd.DataFrame(pval, index=res[:,0], columns=phenotype_df.index)
             pval_df.index.name = 'variant_id'
+        pval_calc_time = time.time() - pval_calc_time_start
 
         if maf_threshold > 0:
             logger.write('  * {} variants passed MAF >= {:.2f} filtering'.format(n_variants, maf_threshold))
         logger.write('done.')
+
+        # print(start.elapsed_time(end))  # milliseconds
+        torch.cuda.synchronize()
+
+        elapsed_time = (time.time()-start_time)
+
+        data_transfer_time = pheno_onload_start.elapsed_time(pheno_onload_end)/1000 + geno_onload_start.elapsed_time(geno_onload_end)/1000 + res_offload_start.elapsed_time(res_offload_end)/1000
+        computation_time = compute_start.elapsed_time(compute_end)/1000 - res_offload_start.elapsed_time(res_offload_end)/1000 - result_reorg_time
+
+        with open("/home/xiaoqihu/git/LiteQTL-G3-supplement/code/tensorqtl/tensorqtl_timing_report.txt", 'a') as file1:
+            file1.write(f'Time_stamp \t Device \t Data_Transfer_time \t computation_time \t reorg_result_time \t pval_calc_time \t elapsed_time_nopval\n')
+            file1.write(f'{datetime.datetime.now()} \t {device} \t {data_transfer_time} \t {computation_time} \t {result_reorg_time} \t {pval_calc_time} \t {elapsed_time}\n')
+
         return pval_df, elapsed_time
 
     else:  # interaction model
@@ -244,7 +310,8 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
 
             pval_df = pd.DataFrame(np.c_[ix0, ix1, pval_g, pval_i, pval_gi, maf],
                                    columns=['variant_id', 'phenotype_id', 'pval_g', 'pval_i', 'pval_gi', 'maf']
-                                   ).astype({'pval_g':np.float64, 'pval_i':np.float64, 'pval_gi':np.float64, 'maf':np.float32})
+                                ).astype({'pval_g':np.float32, 'pval_i':np.float32, 'pval_gi':np.float32, 'maf':np.float32})
+                           #    ).astype({'pval_g':np.float64, 'pval_i':np.float64, 'pval_gi':np.float64, 'maf':np.float32})
             return pval_df
         else:  # dense output
             output_list = []
@@ -394,7 +461,8 @@ def map_permutations(genotype_df, covariates_df, permutations=None,
         logger.write('    time elapsed: {:.2f} min'.format((time.time()-start_time)/60))
         if maf_threshold > 0:
             logger.write('  * {} variants passed MAF >= {:.2f} filtering'.format(n_variants, maf_threshold))
-        max_r2 = max_r2_t.cpu().numpy().astype(np.float64)
+        # max_r2 = max_r2_t.cpu().numpy().astype(np.float64)
+        max_r2 = max_r2_t.cpu().numpy().astype(np.float32)
         tstat = np.sqrt( dof*max_r2 / (1-max_r2) )
         minp_empirical = 2*stats.t.cdf(-np.abs(tstat), dof)
         beta_shape1, beta_shape2, true_dof, minp_vec = fit_beta_parameters(max_r2, dof, tol=1e-4, return_minp=True)
