@@ -49,11 +49,8 @@ def filter_cis(pairs_df, tss_dict, variant_df, window=5000000):
 def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
               return_sparse=True, pval_threshold=1e-5, maf_threshold=0.05,
               alleles=2, return_r2=False, batch_size=20000,
-              logger=None, verbose=True, device="cpu"):
+              logger=None, verbose=True, device="cpu", timing_file=""):
     """Run trans-QTL mapping"""
-    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # device = torch.device("cuda")
-    # device = torch.device("cpu")
 
     if logger is None:
         logger = SimpleLogger(verbose=verbose)
@@ -83,8 +80,6 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
     computation_time = 0.0 
     result_reorg_time = 0.0
     pval_calc_time = 0.0 
-
-    
 
     pheno_onload_start = torch.cuda.Event(enable_timing=True)
     pheno_onload_end = torch.cuda.Event(enable_timing=True)
@@ -127,30 +122,38 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
             # copy genotypes to GPU
             geno_onload_start.record()
             genotypes_t = torch.tensor(genotypes, dtype=torch.float).to(device)
+            genotypes_t = genotypes_t[:,genotype_ix_t]
             geno_onload_end.record() 
 
             compute_start.record()
             # filter by MAF
-            genotypes_t = genotypes_t[:,genotype_ix_t]
             impute_mean(genotypes_t)
             genotypes_t, variant_ids, maf_t = filter_maf(genotypes_t, variant_ids, maf_threshold)
             n_variants += genotypes_t.shape[0]
-
+            
             r_t, genotype_var_t, phenotype_var_t = calculate_corr(genotypes_t, phenotypes_t, residualizer=residualizer, return_var=True)
             del genotypes_t
-
+            
             if return_sparse:
-                m = r_t.abs() >= r_threshold
+                # m = r_t.abs() >= r_threshold
+                m = r_t.abs().type(torch.float32) >= r_threshold
                 ix_t = m.nonzero(as_tuple=False)  # sparse index
-                
                 # r_t = r_t.masked_select(m).type(torch.float64)
                 r_t = r_t.masked_select(m).type(torch.float32)
+
                 r2_t = r_t.pow(2)
                 tstat_t = r_t * torch.sqrt(dof / (1 - r2_t))
+
+                
                 std_ratio_t = torch.sqrt(phenotype_var_t[ix_t[:,1]] / genotype_var_t[ix_t[:,0]])
                 b_t = r_t * std_ratio_t
                 b_se_t = (b_t / tstat_t).type(torch.float32)
+                
+                compute_end.record()
 
+
+
+                # start timing result offloading 
                 res_offload_start.record()
                 ix = ix_t.cpu().numpy()    
                 tstat_tcpu = tstat_t.cpu()
@@ -160,6 +163,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
                 maf_tcpu = maf_t[ix_t[:,0]].cpu()
                 res_offload_end.record()
 
+                # start timing result reporg time. 
                 result_reorg_time_start = time.time()
                 res.append(np.c_[
                     variant_ids[ix[:,0]], phenotype_df.index[ix[:,1]],
@@ -172,7 +176,10 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
                 # r_t = r_t.type(torch.float64)
                 r_t = r_t.type(torch.float32)
                 tstat_t = r_t * torch.sqrt(dof / (1 - r_t.pow(2)))
-                
+
+                compute_end.record()
+                #
+
                 res_offload_start.record()
                 tstat_tcpu = tstat_t.cpu()
                 res_offload_end.record() 
@@ -180,7 +187,7 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
                 result_reorg_time_start = time.time()
                 res.append(np.c_[variant_ids, tstat_tcpu])  
                 result_reorg_time += time.time() - result_reorg_time_start
-            compute_end.record()
+            # compute_end.record()
 
         # logger.write('    elapsed time: {:.2f} sec'.format(elapsed_time))
         del phenotypes_t
@@ -218,12 +225,13 @@ def map_trans(genotype_df, phenotype_df, covariates_df=None, interaction_s=None,
         elapsed_time = (time.time()-start_time)
 
         data_transfer_time = pheno_onload_start.elapsed_time(pheno_onload_end)/1000 + geno_onload_start.elapsed_time(geno_onload_end)/1000 + res_offload_start.elapsed_time(res_offload_end)/1000
-        computation_time = compute_start.elapsed_time(compute_end)/1000 - res_offload_start.elapsed_time(res_offload_end)/1000 - result_reorg_time
+        # computation_time = compute_start.elapsed_time(compute_end)/1000 - res_offload_start.elapsed_time(res_offload_end)/1000 - result_reorg_time
+        computation_time += compute_start.elapsed_time(compute_end)/1000
 
-        with open("/home/xiaoqihu/git/LiteQTL-G3-supplement/code/tensorqtl/tensorqtl_timing_report.txt", 'a') as file1:
-            file1.write(f'Time_stamp \t Device \t Data_Transfer_time \t computation_time \t reorg_result_time \t pval_calc_time \t elapsed_time_nopval\n')
-            file1.write(f'{datetime.datetime.now()} \t {device} \t {data_transfer_time} \t {computation_time} \t {result_reorg_time} \t {pval_calc_time} \t {elapsed_time}\n')
 
+        if timing_file != "":
+            with open(timing_file, 'a') as file1:
+                file1.write(f'{datetime.datetime.now()},{device},{data_transfer_time},{computation_time},{result_reorg_time},{pval_calc_time},{elapsed_time}\n')
         return pval_df, elapsed_time
 
     else:  # interaction model
